@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agricultural Field Boundaries</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<link href="https://unpkg.com/@maplibre/maplibre-gl-compare@0.5.0/dist/maplibre-gl-compare.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/pmtiles@3.0.6/dist/pmtiles.js"></script>
+<script src="https://unpkg.com/@maplibre/maplibre-gl-compare@0.5.0/dist/maplibre-gl-compare.js"></script>
+<style>
+  html, body { height: 100%; margin: 0; font-family: "Segoe UI", system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { flex: none; background: #16251d; color: #fff; padding: 14px 22px; font-size: 20px; font-weight: 600; }
+  #stage { position: relative; flex: 1; min-height: 0; }
+  #comparison-container { position: absolute; inset: 0; }
+  .map { position: absolute; top: 0; bottom: 0; width: 100%; }
+  #toggle { position: absolute; top: 10px; left: 10px; z-index: 10; width: 40px; height: 40px; border: 0; border-radius: 6px;
+            background: #fff; font-size: 20px; cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,.35); }
+  #panel { position: absolute; top: 58px; left: 10px; z-index: 10; width: 280px; max-height: calc(100% - 140px); overflow-y: auto;
+           background: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.35); padding: 14px 16px; font-size: 14px; color: #222; }
+  #panel h3 { margin: 0 0 10px; font-size: 16px; }
+  #panel h4 { margin: 16px 0 6px; font-size: 13px; color: #555; }
+  #panel label { display: flex; align-items: center; gap: 8px; padding: 5px 0; cursor: pointer; }
+  #panel select { width: 100%; padding: 6px; font-size: 14px; }
+  .row { display: flex; justify-content: space-between; align-items: center; }
+  #info { position: absolute; left: 10px; bottom: 28px; z-index: 10; max-width: 320px; max-height: 40%; overflow-y: auto;
+          background: rgba(22,37,29,.92); color: #fff; border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+  #info b { color: #7ee0a8; }
+  #info td { padding: 1px 8px 1px 0; vertical-align: top; word-break: break-word; }
+</style>
+</head>
+<body>
+<header>Agricultural Field Boundaries</header>
+<div id="stage">
+  <div id="comparison-container">
+    <div id="before" class="map"></div>
+    <div id="after" class="map"></div>
+  </div>
+  <button id="toggle" title="Layer swipe">&#9680;</button>
+  <div id="panel">
+    <h3>Layer swipe</h3>
+    <div class="row"><span>Swipe enabled</span><input type="checkbox" id="swipe" checked></div>
+    <h4>Orientation</h4>
+    <select id="orient">
+      <option value="vertical">Vertical (Left/Right)</option>
+      <option value="horizontal">Horizontal (Top/Bottom)</option>
+    </select>
+    <h4>Left layers</h4><div id="left-list"></div>
+    <h4>Right layers</h4><div id="right-list"></div>
+  </div>
+  <div id="info"><b>Crop field boundary</b><br>Click a field to see its properties.</div>
+</div>
+
+<script>
+// All files are read from the same folder as this index.html
+const FILES = {
+  province: "Mundolkiri_Province_Boundary.geojson",
+  pa:       "SWS and PPWS Boundary.geojson",
+  patrol:   "Patrol Block.geojson",
+  cpa:      "CPAs.geojson",
+  fields:   "fields.pmtiles"
+};
+
+// Layers listed in the panel. left/right = ticked by default on that side.
+const DEFS = [
+  { key: "sat", label: "Satellite (Esri)", left: true, right: true,
+    layers: [{ id: "sat", type: "raster" }] },
+  { key: "osm", label: "Street map (Carto)", left: false, right: false,
+    layers: [{ id: "osm", type: "raster" }] },
+  { key: "cpa", label: "CPA", left: false, right: false,
+    layers: [{ id: "cpa-fill", type: "fill", paint: { "fill-color": "#f4a261", "fill-opacity": 0.35 } },
+             { id: "cpa-line", type: "line", paint: { "line-color": "#e76f51", "line-width": 1.5 } }] },
+  { key: "fields", label: "Crop field boundary", left: false, right: true,
+    layers: [{ id: "fields-fill", type: "fill", "source-layer": "fields", paint: { "fill-color": "#e63946", "fill-opacity": 0.45 } },
+             { id: "fields-line", type: "line", "source-layer": "fields", paint: { "line-color": "#ffffff", "line-width": 0.6 } }] },
+  { key: "patrol", label: "Patrol Block", left: false, right: false,
+    layers: [{ id: "patrol-line", type: "line", paint: { "line-color": "#b388ff", "line-width": 2 } }] },
+  { key: "pa", label: "SWS & PPWS boundary", left: true, right: true,
+    layers: [{ id: "pa-line", type: "line", paint: { "line-color": "#2ecc71", "line-width": 2.5 } }] },
+  { key: "province", label: "Mondulkiri province", left: true, right: true,
+    layers: [{ id: "province-line", type: "line", paint: { "line-color": "#ffd166", "line-width": 2.5 } }] }
+];
+
+const DATA = {};
+const missing = [];
+const abs = f => new URL(f, location.href).href;
+
+async function load(f) {
+  try { const r = await fetch(f); if (!r.ok) throw new Error(r.status); return await r.json(); }
+  catch (e) { missing.push(f); return null; }
+}
+
+function bbox(g) {
+  let b = [180, 90, -180, -90];
+  const walk = c => {
+    if (typeof c[0] === "number") b = [Math.min(b[0], c[0]), Math.min(b[1], c[1]), Math.max(b[2], c[0]), Math.max(b[3], c[1])];
+    else c.forEach(walk);
+  };
+  (g.features || [g]).forEach(f => walk((f.geometry || f).coordinates));
+  return b;
+}
+
+function makeStyle(side) {
+  const sources = {
+    sat: { type: "raster", tileSize: 256, attribution: "© Esri, Maxar, Earthstar Geographics",
+           tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"] },
+    osm: { type: "raster", tileSize: 256, attribution: "© OpenStreetMap contributors © CARTO",
+           tiles: ["https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"] },
+    fields: { type: "vector", url: "pmtiles://" + abs(FILES.fields) }
+  };
+  ["province", "pa", "patrol", "cpa"].forEach(k => { if (DATA[k]) sources[k] = { type: "geojson", data: DATA[k] }; });
+  const layers = [];
+  DEFS.forEach(d => {
+    if (!sources[d.key]) return;
+    d.layers.forEach(l => layers.push({ ...l, source: d.key, layout: { visibility: d[side] ? "visible" : "none" } }));
+  });
+  return { version: 8, sources, layers };
+}
+
+function showProps(p) {
+  const info = document.getElementById("info");
+  info.innerHTML = "<b>Crop field boundary</b><table></table>";
+  const t = info.querySelector("table");
+  Object.entries(p).forEach(([k, v]) => {
+    const tr = t.insertRow();
+    tr.insertCell().textContent = k;
+    tr.insertCell().textContent = v;
+  });
+}
+
+(async () => {
+  const keys = ["province", "pa", "patrol", "cpa"];
+  const res = await Promise.all(keys.map(k => load(FILES[k])));
+  keys.forEach((k, i) => DATA[k] = res[i]);
+
+  maplibregl.addProtocol("pmtiles", new pmtiles.Protocol().tile);
+
+  const view = { center: [107.0, 12.5], zoom: 8 };
+  const before = new maplibregl.Map({ container: "before", style: makeStyle("left"), ...view });
+  const after = new maplibregl.Map({ container: "after", style: makeStyle("right"), ...view });
+  after.addControl(new maplibregl.NavigationControl(), "top-right");
+  after.addControl(new maplibregl.ScaleControl(), "bottom-right");
+
+  if (DATA.province) {
+    const b = bbox(DATA.province);
+    [before, after].forEach(m => m.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 40, animate: false }));
+  }
+
+  const orient = document.getElementById("orient");
+  const swipe = document.getElementById("swipe");
+  let cmp = null;
+  const startCompare = () => {
+    after.getContainer().style.clip = "auto";
+    cmp = new maplibregl.Compare(before, after, "#comparison-container", { orientation: orient.value });
+  };
+  const stopCompare = () => { if (cmp) { cmp.remove(); cmp = null; } after.getContainer().style.clip = "auto"; };
+  startCompare();
+
+  orient.onchange = () => { if (swipe.checked) { stopCompare(); startCompare(); } };
+  swipe.onchange = () => {
+    stopCompare();
+    if (swipe.checked) { before.getContainer().style.display = "block"; startCompare(); }
+    else { before.getContainer().style.display = "none"; }
+    before.resize(); after.resize();
+  };
+
+  // Layer tick boxes
+  const available = d => d.key === "sat" || d.key === "osm" || d.key === "fields" || DATA[d.key];
+  [["left", before], ["right", after]].forEach(([side, map]) => {
+    const box = document.getElementById(side + "-list");
+    DEFS.filter(available).forEach(d => {
+      const label = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.checked = d[side];
+      cb.onchange = () => d.layers.forEach(l => map.setLayoutProperty(l.id, "visibility", cb.checked ? "visible" : "none"));
+      label.append(cb, d.label);
+      box.append(label);
+    });
+  });
+
+  document.getElementById("toggle").onclick = () => {
+    const p = document.getElementById("panel");
+    p.style.display = p.style.display === "none" ? "block" : "none";
+  };
+
+  [before, after].forEach(m => m.on("click", "fields-fill", e => showProps(e.features[0].properties)));
+
+  if (missing.length) {
+    document.getElementById("info").innerHTML =
+      "<b>Missing files</b><br>Put these in the same folder as index.html:<br>" + missing.join("<br>");
+  }
+})();
+</script>
+</body>
+</html>
